@@ -131,7 +131,7 @@ static void tcp_westwood_cwnd_reduction(struct sock *sk, int newly_acked_sacked,
 	tp->snd_cwnd = tcp_packets_in_flight(tp) + sndcnt;
 }
 
-static void tcp_westwood_cong_control(struct sock *sk, const struct rate_sample *rs)
+static void tcp_westwood_cong_control(struct sock *sk, u32 ack, int flag, const struct rate_sample *rs)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct westwood *w = inet_csk_ca(sk);

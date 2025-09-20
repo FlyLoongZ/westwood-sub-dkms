@@ -1,0 +1,19 @@
+pkgbase = westwood-sub-dkms
+	pkgdesc = The westwood-sub kernel modules (DKMS)
+	pkgver = 0.1
+	pkgrel = 1
+	url = https://github.com/FlyLoongZ/westwood-sub-dkms
+	arch = x86_64
+	license = GPL3
+	depends = dkms
+	conflicts = westwood-sub
+	source = Makefile
+	source = dkms.conf
+	source = tcp_westwood_sub.c
+	source = Kbuild
+	md5sums = SKIP
+	md5sums = SKIP
+	md5sums = SKIP
+	md5sums = SKIP
+
+pkgname = westwood-sub-dkms

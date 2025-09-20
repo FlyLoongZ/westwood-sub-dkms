@@ -69,6 +69,7 @@ static void tcp_westwood_init(struct sock *sk)
 {
 	struct westwood *w = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
+	u64 initial_pacing_rate;
 
 	w->last_bdp = TCP_INIT_CWND;
 	w->prior_cwnd = TCP_INIT_CWND;
@@ -82,7 +83,7 @@ static void tcp_westwood_init(struct sock *sk)
 	w->last_bw_sample_time = tcp_jiffies32;
 	
 	/* Set initial conservative pacing rate from the start */
-	u64 initial_pacing_rate = (tp->mss_cache * USEC_PER_SEC) / (100 * 1000); /* 1 MSS/100ms */
+	initial_pacing_rate = (tp->mss_cache * USEC_PER_SEC) / (100 * 1000); /* 1 MSS/100ms */
 	sk->sk_pacing_rate = min_t(u64, initial_pacing_rate, sk->sk_max_pacing_rate);
 }
 
@@ -206,11 +207,12 @@ static void tcp_westwood_cong_control(struct sock *sk, u32 ack, int flag, const 
 		/* Set pacing rate based on estimated bandwidth - key improvement */
 		pacing_rate = minmax_get(&w->bw);
 		if (pacing_rate > 0) {
+			u32 gain;
 			/* Convert from (Bytes * BW_UNIT) / us to Bytes/s */
 			pacing_rate = (pacing_rate * USEC_PER_SEC) / BW_UNIT;
 			
 			/* Dynamic pacing gain based on network conditions */
-			u32 gain = 120; /* default ~0.94 gain */
+			gain = 120; /* default ~0.94 gain */
 			
 			/* Increase gain during recovery to help convergence */
 			if (state == TCP_CA_Recovery)

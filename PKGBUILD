@@ -1,6 +1,6 @@
 _pkgbase=westwood-sub
 pkgname=westwood-sub-dkms
-pkgver=0.1
+pkgver=0.2
 pkgrel=1
 pkgdesc="The westwood-sub kernel modules (DKMS)"
 arch=('x86_64')

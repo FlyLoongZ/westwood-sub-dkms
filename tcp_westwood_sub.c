@@ -48,6 +48,10 @@ struct westwood {
 	struct minmax bw;
 	u32    prior_cwnd;
 	u8     prev_ca_state;
+	u32    app_limited;         /* detect application-limited periods */
+	u64    last_bw_sample;      /* last bandwidth sample */
+	u32    bw_sample_cnt;       /* bandwidth sample count */
+	u32    last_bw_sample_time; /* time of last bandwidth sample */
 };
 
 /*
@@ -64,6 +68,7 @@ struct westwood {
 static void tcp_westwood_init(struct sock *sk)
 {
 	struct westwood *w = inet_csk_ca(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 
 	w->last_bdp = TCP_INIT_CWND;
 	w->prior_cwnd = TCP_INIT_CWND;
@@ -71,6 +76,14 @@ static void tcp_westwood_init(struct sock *sk)
 	w->rtt_cnt = 0;
 	minmax_reset(&w->bw, w->rtt_cnt, 0);
 	w->next_rtt_delivered = 0;
+	w->app_limited = 0;
+	w->last_bw_sample = 0;
+	w->bw_sample_cnt = 0;
+	w->last_bw_sample_time = tcp_jiffies32;
+	
+	/* Set initial conservative pacing rate from the start */
+	u64 initial_pacing_rate = (tp->mss_cache * USEC_PER_SEC) / (100 * 1000); /* 1 MSS/100ms */
+	sk->sk_pacing_rate = min_t(u64, initial_pacing_rate, sk->sk_max_pacing_rate);
 }
 
 static void tcp_westwood_event(struct sock *sk, enum tcp_ca_event event)
@@ -100,7 +113,20 @@ static void tcp_westwood_state(struct sock *sk, u8 new_state)
 static u32 tcp_westwood_undo_cwnd(struct sock *sk)
 {
 	struct westwood *w = inet_csk_ca(sk);
+	u64 bw, bdp;
+	u32 undo_cwnd;
 
+	/* Use BDP-based undo if we have reliable bandwidth estimates */
+	if (w->min_rtt_us != 0x7fffffff && w->bw_sample_cnt >= 2) {
+		bw = minmax_get(&w->bw);
+		if (bw > 0) {
+			bdp = (u64)bw * w->min_rtt_us;
+			undo_cwnd = max_t(u32, 2, (((bdp * CAL_UNIT) >> CAL_SCALE) + BW_UNIT - 1) / BW_UNIT);
+			return max_t(u32, undo_cwnd, w->prior_cwnd);
+		}
+	}
+
+	/* Fallback to conservative undo */
 	return max_t(u32, 2, w->prior_cwnd);
 }
 
@@ -108,9 +134,27 @@ static u32 tcp_westwood_ssthresh(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct westwood *w = inet_csk_ca(sk);
+	u64 bw, bdp;
+	u32 new_ssthresh;
 
 	w->prior_cwnd = tp->snd_cwnd;
-	return tcp_sk(sk)->snd_ssthresh;
+
+	/* Use BDP-based ssthresh if we have reliable bandwidth estimates */
+	if (w->min_rtt_us != 0x7fffffff && w->bw_sample_cnt >= 2) {
+		bw = minmax_get(&w->bw);
+		if (bw > 0) {
+			bdp = (u64)bw * w->min_rtt_us;
+			new_ssthresh = max_t(u32, 2, (((bdp * CAL_UNIT) >> CAL_SCALE) + BW_UNIT - 1) / BW_UNIT);
+			
+			/* Conservative ssthresh: use half of BDP */
+			new_ssthresh = max_t(u32, 2, new_ssthresh >> 1);
+			tp->snd_ssthresh = new_ssthresh;
+			return new_ssthresh;
+		}
+	}
+
+	/* Fallback to standard behavior */
+	return max_t(u32, 2, tp->snd_cwnd >> 1);
 }
 
 static void tcp_westwood_cwnd_reduction(struct sock *sk, int newly_acked_sacked, int fast_rexmit)
@@ -136,38 +180,104 @@ static void tcp_westwood_cong_control(struct sock *sk, u32 ack, int flag, const 
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct westwood *w = inet_csk_ca(sk);
 	u8 prev_state = w->prev_ca_state, state = inet_csk(sk)->icsk_ca_state;
-	u64 bw, bdp;
+	u64 bw = 0, bdp = 0, pacing_rate = 0;
 
 	if (!before(rs->prior_delivered, w->next_rtt_delivered)) {
 		w->next_rtt_delivered = tp->delivered;
 		w->rtt_cnt++;
 	}
 
-	bw = (u64)rs->delivered * BW_UNIT;
-	do_div(bw, rs->interval_us);
-	minmax_running_max(&w->bw, 10, w->rtt_cnt, bw);
+	/* Enhanced bandwidth estimation with better sampling */
+	if (rs->delivered > 0 && rs->interval_us > 0) {
+		bw = (u64)rs->delivered * BW_UNIT;
+		do_div(bw, rs->interval_us);
+		
+		/* Improved bandwidth estimation: always filter out application-limited samples */
+		if (!rs->is_app_limited) {
+			minmax_running_max(&w->bw, 10, w->rtt_cnt, bw);
+			w->last_bw_sample = bw;
+			w->bw_sample_cnt++;
+			w->last_bw_sample_time = tcp_jiffies32;
+		}
+		
+		/* Track application-limited periods for better BDP estimation */
+		w->app_limited = rs->is_app_limited ? 1 : 0;
+		
+		/* Set pacing rate based on estimated bandwidth - key improvement */
+		pacing_rate = minmax_get(&w->bw);
+		if (pacing_rate > 0) {
+			/* Convert from (Bytes * BW_UNIT) / us to Bytes/s */
+			pacing_rate = (pacing_rate * USEC_PER_SEC) / BW_UNIT;
+			
+			/* Dynamic pacing gain based on network conditions */
+			u32 gain = 120; /* default ~0.94 gain */
+			
+			/* Increase gain during recovery to help convergence */
+			if (state == TCP_CA_Recovery)
+				gain = 100; /* ~0.78 gain for conservation */
+			else if (state == TCP_CA_Open && !w->app_limited)
+				gain = 125; /* ~0.98 gain for probing */
+				
+			pacing_rate = (pacing_rate * gain) >> 7;
+			sk->sk_pacing_rate = min_t(u64, pacing_rate, sk->sk_max_pacing_rate);
+		} else {
+			/* Initial pacing rate when no bandwidth samples are available */
+			pacing_rate = (tp->mss_cache * USEC_PER_SEC) / (100 * 1000); /* 1 MSS/100ms */
+			sk->sk_pacing_rate = min_t(u64, pacing_rate, sk->sk_max_pacing_rate);
+		}
+	} else {
+		/* Handle stale bandwidth samples - degrade pacing rate if no recent samples */
+		u32 time_since_last_sample = tcp_jiffies32 - w->last_bw_sample_time;
+		if (w->bw_sample_cnt > 0 && time_since_last_sample > 5 * HZ) { /* 5 seconds */
+			pacing_rate = sk->sk_pacing_rate;
+			if (pacing_rate > 0) {
+				/* Gradually reduce pacing rate by 10% */
+				pacing_rate = (pacing_rate * 9) / 10;
+				pacing_rate = max_t(u64, pacing_rate, (tp->mss_cache * USEC_PER_SEC) / (100 * 1000));
+				sk->sk_pacing_rate = min_t(u64, pacing_rate, sk->sk_max_pacing_rate);
+			}
+		}
+	}
 
 	if (rs->rtt_us > 0 && rs->rtt_us <= w->min_rtt_us)
 		w->min_rtt_us = rs->rtt_us;
 
 	w->prev_ca_state = state;
 	if (state == TCP_CA_Recovery && prev_state != TCP_CA_Recovery) {
-		if (w->min_rtt_us == 0x7fffffff)
-			w->last_bdp = TCP_INIT_CWND;
+		/* Enhanced BDP calculation on congestion detection */
+		if (w->min_rtt_us == 0x7fffffff || w->bw_sample_cnt < 2)
+			w->last_bdp = max_t(u32, TCP_INIT_CWND, tp->snd_cwnd >> 1);
 		else {
 			bw = minmax_get(&w->bw);
+			/* More conservative BDP during recovery */
 			bdp = (u64)bw * w->min_rtt_us;
-			w->last_bdp = (((bdp * CAL_UNIT) >> CAL_SCALE) + BW_UNIT - 1) / BW_UNIT;
+			w->last_bdp = max_t(u32, 2, (((bdp * CAL_UNIT) >> CAL_SCALE) + BW_UNIT - 1) / BW_UNIT);
+			
+			/* Adaptive ssthresh based on BDP and current conditions */
+			if (w->app_limited)
+				tp->snd_ssthresh = max_t(u32, 2, w->last_bdp);
+			else
+				tp->snd_ssthresh = max_t(u32, 2, w->last_bdp >> 1);
 		}
-		tp->snd_ssthresh = max_t(u32, 2, tp->snd_cwnd >> 1);
 	} else if (state == TCP_CA_Open && prev_state != TCP_CA_Open) {
-		tp->snd_cwnd = w->last_bdp;
+		/* Smooth transition to open state */
+		if (w->last_bdp > 0) {
+			tp->snd_cwnd = min_t(u32, w->last_bdp, tp->snd_cwnd + (tp->snd_cwnd >> 2));
+		}
 		tcp_westwood_cwnd_reduction(sk, rs->acked_sacked, 1);
 	} else if (state == TCP_CA_Open) {
-		tcp_reno_cong_avoid(sk, 0, rs->acked_sacked);
+		/* Enhanced congestion avoidance with BDP awareness */
+		if (w->last_bdp > 0 && tp->snd_cwnd < w->last_bdp) {
+			/* Fast convergence to BDP when under-utilizing */
+			tcp_cong_avoid_ai(tp, w->last_bdp, rs->acked_sacked);
+		} else {
+			/* Standard Reno behavior when near or above BDP */
+			tcp_reno_cong_avoid(sk, 0, rs->acked_sacked);
+		}
 	}
 	if (debug)
-		printk("##st:%d->%d bw:%llu last_bdp:%d cwnd:%d minrtt:%d\n", prev_state, state, bw, w->last_bdp, tp->snd_cwnd, w->min_rtt_us);
+		printk("##st:%d->%d bw:%llu last_bdp:%d cwnd:%d minrtt:%d pacing:%lu\n",
+			prev_state, state, bw, w->last_bdp, tp->snd_cwnd, w->min_rtt_us, sk->sk_pacing_rate);
 }
 
 /* Extract info for Tcp socket info provided via netlink. */

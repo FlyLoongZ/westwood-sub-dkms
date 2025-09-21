@@ -4,7 +4,7 @@ KERNELRELEASE	?= `uname -r`
 KERNEL_DIR	?= /lib/modules/$(KERNELRELEASE)/build
 PWD		:= $(shell pwd)
 
-EXTRA_CFLAGS += -Wall -g
+EXTRA_CFLAGS += -Wall
 
 all: 
 	@echo "Building tcp_westwood_sub..."

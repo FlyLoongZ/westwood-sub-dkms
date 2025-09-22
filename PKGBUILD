@@ -1,7 +1,7 @@
 _pkgbase=westwood-sub
 pkgname=westwood-sub-dkms
 pkgver=0.2
-pkgrel=1
+pkgrel=2
 pkgdesc="The westwood-sub kernel modules (DKMS)"
 arch=('x86_64')
 url="https://github.com/FlyLoongZ/westwood-sub-dkms"

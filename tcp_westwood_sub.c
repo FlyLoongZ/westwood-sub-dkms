@@ -29,7 +29,6 @@
 #include <net/tcp.h>
 #include <linux/win_minmax.h>
 
-/* 参数配置 - 体现"稳健性优先" */
 #define WESTWOOD_BW_FILTER_WINDOW   10    /* BBR启发的时间窗口 */
 #define WESTWOOD_RTT_FILTER_WINDOW  10    
 #define WESTWOOD_PROBE_RTT_INTERVAL (10 * HZ)  
@@ -41,16 +40,16 @@ struct westwood {
     struct minmax bw;              /* 窗口内最大带宽 (bytes/sec) */
     u32    bw_sample_count;
     
-    /* RTT测量 - 简化，移除未使用的rtt_filter */
+    /* RTT测量 */
     u32    min_rtt_us;             /* 窗口内最小RTT */
     u32    min_rtt_stamp;
     u32    rtt_sample_count;
     
-    /* 状态维护 - 简化，移除未使用的delivered_at_last_sample */
+    /* 状态维护 */
     u32    prior_cwnd;             /* 仅用于undo */
     u32    last_sample_time;
     
-    /* 鲁棒性控制 - 简化RTT探测逻辑 */
+    /* 鲁棒性控制 */
     u32    probe_rtt_done_stamp;
     
     /* 统计信息 */
@@ -119,7 +118,6 @@ static u32 tcp_westwood_undo_cwnd(struct sock *sk)
     return max(tcp_sk(sk)->snd_cwnd, w->prior_cwnd);
 }
 
-/* 修复：简化状态处理，只记录必要信息 */
 static void tcp_westwood_state(struct sock *sk, u8 new_state)
 {
     struct westwood *w = inet_csk_ca(sk);
@@ -143,7 +141,6 @@ static void tcp_westwood_state(struct sock *sk, u8 new_state)
     }
 }
 
-/* 简化RTT更新：移除强制cwnd调整，避免与PRR冲突 */
 static void westwood_update_min_rtt(struct sock *sk, u32 rtt_us)
 {
     struct westwood *w = inet_csk_ca(sk);
@@ -181,7 +178,6 @@ static void westwood_update_bandwidth(struct sock *sk, const struct rate_sample 
         }
     }
     
-    /* 修复：正确计算带宽 - delivered是包数，需要转换为字节 */
     bw_sample = div64_u64((u64)rs->delivered * tp->mss_cache * USEC_PER_SEC,
                   rs->interval_us);
     
@@ -194,7 +190,6 @@ static void westwood_update_bandwidth(struct sock *sk, const struct rate_sample 
     w->last_sample_time = tp->tcp_mstamp;
 }
 
-/* RTT统计更新 - 修复：移除未使用的滤波器，直接更新min_rtt */
 static void westwood_update_rtt(struct sock *sk, const struct rate_sample *rs)
 {
     struct westwood *w = inet_csk_ca(sk);
@@ -226,7 +221,6 @@ static void westwood_update_pacing(struct sock *sk)
     }
 }
 
-/* 修复：简化cong_control - 只负责测量和pacing */
 static void tcp_westwood_cong_control(struct sock *sk, u32 ack, int flag,
                       const struct rate_sample *rs)
 {
@@ -238,7 +232,6 @@ static void tcp_westwood_cong_control(struct sock *sk, u32 ack, int flag,
     westwood_update_pacing(sk);
 }
 
-/* 修复：简化ECN处理，不直接操作状态机 */
 static void tcp_westwood_cwnd_event(struct sock *sk, enum tcp_ca_event event)
 {
     struct westwood *w = inet_csk_ca(sk);
@@ -254,17 +247,16 @@ static void tcp_westwood_cwnd_event(struct sock *sk, enum tcp_ca_event event)
     }
 }
 
-/* 修复：正确的调试信息映射 */
 static size_t tcp_westwood_get_info(struct sock *sk, u32 ext, int *attr,
                     union tcp_cc_info *info)
 {
     const struct westwood *w = inet_csk_ca(sk);
     
     if (ext & (1 << (INET_DIAG_VEGASINFO - 1))) {
-        info->vegas.tcpv_enabled = 1;
-        info->vegas.tcpv_rttcnt = w->rtt_samples_total;
-        info->vegas.tcpv_rtt = w->min_rtt_us;
-        info->vegas.tcpv_minrtt = minmax_get(&w->bw);  /* 修复：带宽信息 */
+        info->vegas.tcpv_enabled = 1;                    /* 算法启用状态 */
+        info->vegas.tcpv_rttcnt = w->rtt_samples_total;  /* RTT样本总数 */
+        info->vegas.tcpv_rtt = w->min_rtt_us;           /* 当前最小RTT */
+        info->vegas.tcpv_minrtt = w->min_rtt_us;        /* 修复：最小RTT值，而非带宽 */
         
         *attr = INET_DIAG_VEGASINFO;
         return sizeof(struct tcpvegas_info);
@@ -272,11 +264,10 @@ static size_t tcp_westwood_get_info(struct sock *sk, u32 ext, int *attr,
     return 0;
 }
 
-/* 修复：使用单一cong_control接口，配合内核PRR */
 static struct tcp_congestion_ops tcp_westwood __read_mostly = {
     .init           = tcp_westwood_init,
     .ssthresh       = tcp_westwood_ssthresh,
-    .cong_control   = tcp_westwood_cong_control,  /* 只使用cong_control */
+    .cong_control   = tcp_westwood_cong_control,
     .undo_cwnd      = tcp_westwood_undo_cwnd,
     .set_state      = tcp_westwood_state,
     .cwnd_event     = tcp_westwood_cwnd_event,

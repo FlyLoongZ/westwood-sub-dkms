@@ -52,3 +52,4 @@ Mkfile.old
 
 # PKG
 *.pkg.tar* 
+.aider*
